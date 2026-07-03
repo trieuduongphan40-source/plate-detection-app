@@ -1,7 +1,9 @@
 ultralytics==8.4.82
 easyocr
-opencv-python-headless
+opencv-python-headless==4.8.1.78
 gdown
 Pillow
 streamlit
 numpy
+torch
+torchvision
