@@ -84,43 +84,41 @@ def run_ocr(crop_bgr):
 
 # ─── Nhận diện màu xe ───
 def detect_color(region_bgr):
-    """Nhận diện màu xe từ vùng ảnh xe bằng HSV."""
     if region_bgr is None or region_bgr.size == 0:
         return 'Không rõ'
 
     hsv = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2HSV)
-    h   = hsv[:,:,0]
-    s   = hsv[:,:,1]
-    v   = hsv[:,:,2]
+    h = hsv[:,:,0]
+    s = hsv[:,:,1]
+    v = hsv[:,:,2]
 
-    # Lọc bỏ vùng quá tối hoặc quá sáng (kính, gương, bóng)
-    mask = (s > 30) & (v > 40) & (v < 240)
-    if mask.sum() < 100:
-        # Ảnh xám/trắng/đen — phân biệt qua V
-        mean_v = v.mean()
-        if mean_v > 180: return 'Trắng'
-        if mean_v < 60:  return 'Đen'
-        return 'Xám/Bạc'
+    mean_v = float(v.mean())
+    mean_s = float(s.mean())
 
-    h_filtered = h[mask]
-    mean_h     = float(np.median(h_filtered))
-    mean_s     = float(s[mask].mean())
-    mean_v     = float(v[mask].mean())
-
-    # Xám/bạc — saturation thấp
-    if mean_s < 40:
-        if mean_v > 180: return 'Trắng'
+    # Ưu tiên phát hiện trắng/đen/xám trước
+    # vì xe bãi giữ thường bị ánh đèn làm sai màu
+    if mean_s < 50:
+        if mean_v > 160: return 'Trắng/Bạc'
         if mean_v < 70:  return 'Đen'
         return 'Xám/Bạc'
 
-    # Phân loại theo Hue
-    if mean_h < 10 or mean_h > 160:   return 'Đỏ'
-    if 10  <= mean_h < 25:             return 'Cam'
-    if 25  <= mean_h < 35:             return 'Vàng'
-    if 35  <= mean_h < 85:             return 'Xanh lá'
-    if 85  <= mean_h < 130:            return 'Xanh dương'
-    if 130 <= mean_h < 160:            return 'Tím'
-    return 'Không rõ'
+    # Chỉ xét màu thật khi saturation đủ cao
+    mask = (s > 60) & (v > 50) & (v < 230)
+    if mask.sum() < 200:
+        if mean_v > 160: return 'Trắng/Bạc'
+        if mean_v < 70:  return 'Đen'
+        return 'Xám/Bạc'
+
+    h_vals  = h[mask]
+    mean_h  = float(np.median(h_vals))
+
+    if mean_h < 10 or mean_h > 160: return 'Đỏ'
+    if 10  <= mean_h < 25:          return 'Cam'
+    if 25  <= mean_h < 35:          return 'Vàng'
+    if 35  <= mean_h < 85:          return 'Xanh lá'
+    if 85  <= mean_h < 130:         return 'Xanh dương'
+    if 130 <= mean_h < 160:         return 'Tím'
+    return 'Xám/Bạc'
 
 # ─── Helper ───
 def box_contains_center(outer, inner):
