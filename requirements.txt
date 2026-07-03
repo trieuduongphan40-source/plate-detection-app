@@ -1,0 +1,6 @@
+ultralytics==8.4.82
+easyocr
+opencv-python-headless
+gdown
+Pillow
+streamlit
