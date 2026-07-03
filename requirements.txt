@@ -1,9 +1,7 @@
-ultralytics==8.4.82
-easyocr
-opencv-python-headless==4.8.1.78
+streamlit
 gdown
 Pillow
-streamlit
 numpy
-torch
-torchvision
+ultralytics
+easyocr
+opencv-python-headless
