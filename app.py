@@ -9,21 +9,27 @@ from ultralytics import YOLO
 
 # ─── Cấu hình trang ───
 st.set_page_config(
-    page_title='Nhận Diện Biển Số Xe',
+    page_title='Nhận Diện Phương Tiện & Biển Số',
     page_icon='🚗',
     layout='centered'
 )
 
-st.title('🚗 Hệ Thống Nhận Diện Biển Số Xe Việt Nam')
-st.markdown('Upload ảnh hoặc video — hệ thống sẽ tự động detect biển số và loại xe.')
+st.title('🚗 Hệ Thống Nhận Diện Phương Tiện & Biển Số')
+st.markdown('''
+Hệ thống tự động nhận diện:
+- 🚘 **Loại xe** (ô tô, xe máy, xe buýt, xe tải)
+- 🎨 **Màu xe**
+- 🔢 **Biển số xe**
 
-# ─── Load model (cache để không tải lại mỗi lần) ───
+*Ứng dụng: Ghi nhận thông tin phương tiện khi xảy ra va chạm giao thông.*
+''')
+
+# ─── Load model ───
 @st.cache_resource
 def load_models():
-    # Download best.pt từ Google Drive nếu chưa có
     model_path = 'best.pt'
     if not os.path.exists(model_path):
-        with st.spinner('Đang tải model lần đầu (chỉ mất 1 lần)...'):
+        with st.spinner('Đang tải model lần đầu...'):
             gdown.download(
                 'https://drive.google.com/uc?id=1cV3XdX9FP-hIqhmOBg6QIgnYp7FbZwzt',
                 model_path, quiet=False
@@ -33,8 +39,11 @@ def load_models():
     return plate_model, vehicle_model
 
 plate_model, vehicle_model = load_models()
-
 VEHICLE_CLASSES = {2:'car', 3:'motorcycle', 5:'bus', 7:'truck'}
+VEHICLE_VI = {
+    'car': 'Ô tô', 'motorcycle': 'Xe máy',
+    'bus': 'Xe buýt', 'truck': 'Xe tải', 'unknown': 'Không rõ'
+}
 
 # ─── OCR ───
 @st.cache_resource
@@ -73,6 +82,47 @@ def run_ocr(crop_bgr):
     conf   = max([r[2] for r in result])
     return fix_plate(text), round(conf, 4)
 
+# ─── Nhận diện màu xe ───
+def detect_color(region_bgr):
+    """Nhận diện màu xe từ vùng ảnh xe bằng HSV."""
+    if region_bgr is None or region_bgr.size == 0:
+        return 'Không rõ'
+
+    hsv = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2HSV)
+    h   = hsv[:,:,0]
+    s   = hsv[:,:,1]
+    v   = hsv[:,:,2]
+
+    # Lọc bỏ vùng quá tối hoặc quá sáng (kính, gương, bóng)
+    mask = (s > 30) & (v > 40) & (v < 240)
+    if mask.sum() < 100:
+        # Ảnh xám/trắng/đen — phân biệt qua V
+        mean_v = v.mean()
+        if mean_v > 180: return 'Trắng'
+        if mean_v < 60:  return 'Đen'
+        return 'Xám/Bạc'
+
+    h_filtered = h[mask]
+    mean_h     = float(np.median(h_filtered))
+    mean_s     = float(s[mask].mean())
+    mean_v     = float(v[mask].mean())
+
+    # Xám/bạc — saturation thấp
+    if mean_s < 40:
+        if mean_v > 180: return 'Trắng'
+        if mean_v < 70:  return 'Đen'
+        return 'Xám/Bạc'
+
+    # Phân loại theo Hue
+    if mean_h < 10 or mean_h > 160:   return 'Đỏ'
+    if 10  <= mean_h < 25:             return 'Cam'
+    if 25  <= mean_h < 35:             return 'Vàng'
+    if 35  <= mean_h < 85:             return 'Xanh lá'
+    if 85  <= mean_h < 130:            return 'Xanh dương'
+    if 130 <= mean_h < 160:            return 'Tím'
+    return 'Không rõ'
+
+# ─── Helper ───
 def box_contains_center(outer, inner):
     ox1,oy1,ox2,oy2 = outer
     ix1,iy1,ix2,iy2 = inner
@@ -81,6 +131,8 @@ def box_contains_center(outer, inner):
 
 # ─── Hàm detect chính ───
 def detect(img_bgr, conf=0.25):
+    h_img, w_img = img_bgr.shape[:2]
+
     # Detect xe
     vehicles = []
     for r in vehicle_model.predict(img_bgr, conf=conf, verbose=False):
@@ -89,9 +141,16 @@ def detect(img_bgr, conf=0.25):
             cid = int(b.cls[0].item())
             if cid in VEHICLE_CLASSES:
                 x1,y1,x2,y2 = map(int, b.xyxy[0].cpu().numpy())
+                # Crop vùng thân xe (bỏ 30% dưới để tránh lấy đường)
+                y_crop = y1 + int((y2-y1)*0.1)
+                y_crop_end = y1 + int((y2-y1)*0.7)
+                region = img_bgr[y_crop:y_crop_end, x1:x2]
+                color  = detect_color(region)
                 vehicles.append({
-                    'box': (x1,y1,x2,y2),
-                    'type': VEHICLE_CLASSES[cid]
+                    'box':   (x1,y1,x2,y2),
+                    'type':  VEHICLE_CLASSES[cid],
+                    'color': color,
+                    'conf':  float(b.conf[0].item())
                 })
 
     # Detect biển số
@@ -102,26 +161,28 @@ def detect(img_bgr, conf=0.25):
             px1,py1,px2,py2 = map(int, b.xyxy[0].cpu().numpy())
             plate_conf = float(b.conf[0].item())
 
-            v_type = 'unknown'
+            # Ghép với xe
+            matched = None
             for v in vehicles:
                 if box_contains_center(v['box'],(px1,py1,px2,py2)):
-                    v_type = v['type']
+                    matched = v
                     break
 
-            h,w = img_bgr.shape[:2]
+            # OCR
             pad  = 4
-            crop = img_bgr[max(0,py1-pad):min(h,py2+pad),
-                           max(0,px1-pad):min(w,px2+pad)]
+            crop = img_bgr[max(0,py1-pad):min(h_img,py2+pad),
+                           max(0,px1-pad):min(w_img,px2+pad)]
             if crop.size == 0: continue
-
             plate_text, ocr_conf = run_ocr(crop)
 
             detections.append({
-                'plate_box':   (px1,py1,px2,py2),
-                'plate_text':  plate_text,
-                'plate_conf':  plate_conf,
-                'ocr_conf':    ocr_conf,
-                'vehicle_type': v_type,
+                'plate_box':    (px1,py1,px2,py2),
+                'plate_text':   plate_text,
+                'plate_conf':   plate_conf,
+                'ocr_conf':     ocr_conf,
+                'vehicle_type': matched['type']  if matched else 'unknown',
+                'vehicle_color':matched['color'] if matched else 'Không rõ',
+                'plate_crop':   crop,
             })
 
     # Vẽ kết quả
@@ -129,28 +190,35 @@ def detect(img_bgr, conf=0.25):
     for v in vehicles:
         x1,y1,x2,y2 = v['box']
         cv2.rectangle(vis,(x1,y1),(x2,y2),(0,200,0),2)
-        cv2.putText(vis, v['type'], (x1, max(y1-10,0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,200,0), 2)
+        label = f"{VEHICLE_VI[v['type']]} | {v['color']}"
+        cv2.putText(vis, label, (x1, max(y1-10,0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,220,0), 2)
     for d in detections:
         x1,y1,x2,y2 = d['plate_box']
         cv2.rectangle(vis,(x1,y1),(x2,y2),(255,50,50),2)
-        label = f"{d['vehicle_type']}: {d['plate_text']}"
-        cv2.putText(vis, label, (x1, min(y2+22, vis.shape[0]-5)),
+        label = d['plate_text'] if d['plate_text'] else '?'
+        cv2.putText(vis, label, (x1, min(y2+22,vis.shape[0]-5)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,50,50), 2)
 
-    return vis, detections
+    return vis, detections, vehicles
 
 # ─── UI ───
 st.sidebar.header('⚙️ Cài đặt')
 conf_threshold = st.sidebar.slider(
-    'Ngưỡng confidence', 0.1, 0.9, 0.25, 0.05
+    'Ngưỡng confidence', 0.1, 0.9, 0.25, 0.05,
+    help='Càng cao càng ít detect nhưng chính xác hơn'
 )
+st.sidebar.markdown('---')
+st.sidebar.markdown('**Về hệ thống:**')
+st.sidebar.markdown('- Model: YOLOv8n')
+st.sidebar.markdown('- mAP50: **96.4%**')
+st.sidebar.markdown('- Dataset: 10,127 ảnh biển số VN')
 
 tab1, tab2 = st.tabs(['📷 Ảnh', '🎬 Video'])
 
 with tab1:
     uploaded = st.file_uploader(
-        'Upload ảnh', type=['jpg','jpeg','png'],
+        'Upload ảnh xe', type=['jpg','jpeg','png'],
         key='img_upload'
     )
     if uploaded:
@@ -158,21 +226,53 @@ with tab1:
         img_bgr    = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
         with st.spinner('Đang phân tích...'):
-            result_img, detections = detect(img_bgr, conf_threshold)
+            result_img, detections, vehicles = detect(img_bgr, conf_threshold)
 
-        st.image(result_img, caption='Kết quả detect', use_column_width=True)
+        st.image(result_img, caption='Kết quả', use_column_width=True)
 
-        if not detections:
-            st.warning('Không tìm thấy biển số trong ảnh.')
+        if not detections and not vehicles:
+            st.warning('Không phát hiện phương tiện nào trong ảnh.')
         else:
-            st.success(f'Tìm thấy {len(detections)} biển số!')
+            # Hiện xe không có biển
+            plates_matched = set()
+            for d in detections:
+                plates_matched.add(id(d))
+
+            st.success(f'Phát hiện {len(vehicles)} phương tiện, '
+                       f'{len(detections)} biển số!')
+
             for i, d in enumerate(detections):
-                with st.expander(f'Biển số #{i+1} — {d["plate_text"] or "Không đọc được"}'):
+                with st.expander(
+                    f'🚘 Phương tiện #{i+1} — '
+                    f'{VEHICLE_VI[d["vehicle_type"]]} | '
+                    f'{d["vehicle_color"]} | '
+                    f'Biển: {d["plate_text"] or "Không đọc được"}'
+                ):
                     col1, col2 = st.columns(2)
-                    col1.metric('Loại xe',       d['vehicle_type'])
-                    col1.metric('Biển số (OCR)',  d['plate_text'] or 'N/A')
-                    col2.metric('Detect conf',   f"{d['plate_conf']:.1%}")
-                    col2.metric('OCR conf',      f"{d['ocr_conf']:.1%}")
+                    col1.metric('Loại xe',    VEHICLE_VI[d['vehicle_type']])
+                    col1.metric('Màu xe',     d['vehicle_color'])
+                    col2.metric('Biển số',    d['plate_text'] or 'N/A')
+                    col2.metric('Độ tin cậy detect', f"{d['plate_conf']:.1%}")
+
+                    if d['plate_crop'] is not None and d['plate_crop'].size > 0:
+                        crop_rgb = cv2.cvtColor(
+                            d['plate_crop'], cv2.COLOR_BGR2RGB
+                        )
+                        st.image(crop_rgb, caption='Ảnh biển số (crop)',
+                                 width=300)
+
+            # Tóm tắt báo cáo
+            if detections:
+                st.markdown('---')
+                st.markdown('### 📋 Báo cáo nhanh')
+                for i, d in enumerate(detections):
+                    plate_str = d['plate_text'] if d['plate_text'] else 'Không đọc được'
+                    st.markdown(
+                        f"**Xe #{i+1}:** "
+                        f"{VEHICLE_VI[d['vehicle_type']]} | "
+                        f"Màu {d['vehicle_color']} | "
+                        f"Biển số: `{plate_str}`"
+                    )
 
 with tab2:
     uploaded_vid = st.file_uploader(
@@ -188,40 +288,57 @@ with tab2:
         total_fr = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps      = cap.get(cv2.CAP_PROP_FPS) or 25
 
-        st.info(f'Video: {total_fr} frames, {fps:.0f} FPS — xử lý mỗi 10 frame')
+        st.info(f'Video: {total_fr} frames | {fps:.0f} FPS | '
+                f'Xử lý mỗi 10 frames')
 
-        frame_placeholder = st.empty()
-        progress          = st.progress(0)
-        all_plates        = set()
+        frame_ph  = st.empty()
+        progress  = st.progress(0)
+        log_ph    = st.empty()
+        all_info  = {}  # plate_text -> {type, color, count}
 
         frame_idx = 0
         while True:
             ret, frame = cap.read()
             if not ret: break
             frame_idx += 1
+            if frame_idx % 10 != 0: continue
 
-            # Chỉ xử lý mỗi 10 frame cho nhanh
-            if frame_idx % 10 != 0:
-                continue
-
-            result_frame, dets = detect(frame, conf_threshold)
+            result_frame, dets, _ = detect(frame, conf_threshold)
             for d in dets:
-                if d['plate_text']:
-                    all_plates.add(d['plate_text'])
+                key = d['plate_text'] or f'unknown_{frame_idx}'
+                if key not in all_info:
+                    all_info[key] = {
+                        'type':  VEHICLE_VI[d['vehicle_type']],
+                        'color': d['vehicle_color'],
+                        'count': 1
+                    }
+                else:
+                    all_info[key]['count'] += 1
 
-            frame_placeholder.image(
-                result_frame,
-                caption=f'Frame {frame_idx}/{total_fr}',
-                use_column_width=True
-            )
+            frame_ph.image(result_frame,
+                           caption=f'Frame {frame_idx}/{total_fr}',
+                           use_column_width=True)
             progress.progress(min(frame_idx/total_fr, 1.0))
 
+            # Cập nhật log
+            if all_info:
+                log_text = '**Phương tiện đã ghi nhận:**\n'
+                for plate, info in all_info.items():
+                    log_text += (f"- {info['type']} | "
+                                 f"Màu {info['color']} | "
+                                 f"Biển: `{plate}` "
+                                 f"({info['count']} lần)\n")
+                log_ph.markdown(log_text)
+
         cap.release()
-        st.success(f'Xong! Tổng biển số unique: {len(all_plates)}')
-        if all_plates:
-            st.write('Các biển số đã detect được:')
-            for p in sorted(all_plates):
-                st.code(p)
+        st.success('Xử lý xong!')
+        st.markdown('### 📋 Tổng kết')
+        for plate, info in all_info.items():
+            st.markdown(
+                f"🚘 **{info['type']}** | "
+                f"Màu {info['color']} | "
+                f"Biển: `{plate}`"
+            )
 
 st.markdown('---')
-st.caption('Model: YOLOv8n trained trên dataset biển số Việt Nam | mAP50: 96.4%')
+st.caption('Model: YOLOv8n | mAP50: 96.4% | Dataset: 10,127 ảnh biển số VN')
