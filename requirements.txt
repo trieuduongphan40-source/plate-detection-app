@@ -8,3 +8,5 @@ numpy
 ultralytics
 easyocr
 opencv-python-headless
+imageio
+imageio-ffmpeg
