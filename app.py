@@ -28,19 +28,26 @@ Hệ thống tự động nhận diện:
 # ============================================================
 # 1. LOAD MODEL (chạy 1 lần lúc khởi động app)
 # ============================================================
-import gdown
-
 MODEL_PATH = 'best.pt'
 if not os.path.exists(MODEL_PATH):
     # Thay FILE_ID bằng ID thật của file best.pt trên Google Drive
     # (lấy từ link share: drive.google.com/file/d/FILE_ID/view)
-   gdown.download(id='1QDoeKQBMa9O9riapJhxdmzxMozFfPIPL', output=MODEL_PATH, quiet=False)
+    gdown.download(id='1QDoeKQBMa9O9riapJhxdmzxMozFfPIPL', output=MODEL_PATH, quiet=False)
 plate_model = YOLO(MODEL_PATH)
 vehicle_model = YOLO('yolov8n.pt')             # model COCO gốc, có sẵn, không cần train
 ocr_reader = easyocr.Reader(['en'], gpu=False) # đổi gpu=True nếu máy có GPU
 
 # Các class xe trong COCO (chỉ giữ lại loại liên quan)
 VEHICLE_CLASSES = {2: 'Car', 3: 'Motorbike', 5: 'Bus', 7: 'Truck'}
+
+# Dịch tên loại xe sang tiếng Việt để hiển thị
+VEHICLE_VI = {
+    'Car': 'Ô tô',
+    'Motorbike': 'Xe máy',
+    'Bus': 'Xe buýt',
+    'Truck': 'Xe tải',
+    'Không xác định': 'Không xác định',
+}
 
 
 # ============================================================
@@ -72,7 +79,7 @@ def detect_vehicle_color(vehicle_crop):
     hsv = cv2.cvtColor(vehicle_crop, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    avg_h = np.median(h[s > 40])  if np.any(s > 40) else np.median(h)
+    avg_h = np.median(h[s > 40]) if np.any(s > 40) else np.median(h)
     avg_s = np.median(s)
     avg_v = np.median(v)
 
@@ -201,6 +208,8 @@ def detect_vehicle_and_plate(frame, conf_threshold=0.25):
         })
 
     return result_img, results, vehicle_boxes
+
+
 # ─── UI ───
 st.sidebar.header('⚙️ Cài đặt')
 conf_threshold = st.sidebar.slider(
@@ -225,18 +234,13 @@ with tab1:
         img_bgr    = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
         with st.spinner('Đang phân tích...'):
-            result_img, detections, vehicles = detect(img_bgr, conf_threshold)
+            result_img, detections, vehicles = detect_vehicle_and_plate(img_bgr, conf_threshold)
 
         st.image(result_img, caption='Kết quả', use_column_width=True)
 
         if not detections and not vehicles:
             st.warning('Không phát hiện phương tiện nào trong ảnh.')
         else:
-            # Hiện xe không có biển
-            plates_matched = set()
-            for d in detections:
-                plates_matched.add(id(d))
-
             st.success(f'Phát hiện {len(vehicles)} phương tiện, '
                        f'{len(detections)} biển số!')
 
@@ -260,7 +264,6 @@ with tab1:
                         st.image(crop_rgb, caption='Ảnh biển số (crop)',
                                  width=300)
 
-            # Tóm tắt báo cáo
             if detections:
                 st.markdown('---')
                 st.markdown('### 📋 Báo cáo nhanh')
@@ -298,11 +301,13 @@ with tab2:
         frame_idx = 0
         while True:
             ret, frame = cap.read()
-            if not ret: break
+            if not ret:
+                break
             frame_idx += 1
-            if frame_idx % 10 != 0: continue
+            if frame_idx % 10 != 0:
+                continue
 
-        result_frame, dets, _ = detect_vehicle_and_plate(frame, conf_threshold)
+            result_frame, dets, _ = detect_vehicle_and_plate(frame, conf_threshold)
             for d in dets:
                 key = d['plate_text'] or f'unknown_{frame_idx}'
                 if key not in all_info:
@@ -319,7 +324,6 @@ with tab2:
                            use_column_width=True)
             progress.progress(min(frame_idx/total_fr, 1.0))
 
-            # Cập nhật log
             if all_info:
                 log_text = '**Phương tiện đã ghi nhận:**\n'
                 for plate, info in all_info.items():
@@ -338,5 +342,6 @@ with tab2:
                 f"Màu {info['color']} | "
                 f"Biển: `{plate}`"
             )
+
 st.markdown('---')
 st.caption('Model: YOLOv8n | mAP50: 96.4% | Dataset: 10,127 ảnh biển số VN')
