@@ -28,7 +28,7 @@ Hệ thống tự động nhận diện:
 # ============================================================
 # 1. LOAD MODEL (chạy 1 lần lúc khởi động app)
 # ============================================================
-plate_model = YOLO('weights/best.pt')          # model biển số bạn đã train
+plate_model = YOLO('runs/final_yolov8n_50ep/weights/best.pt')          # model biển số bạn đã train
 vehicle_model = YOLO('yolov8n.pt')             # model COCO gốc, có sẵn, không cần train
 ocr_reader = easyocr.Reader(['en'], gpu=False) # đổi gpu=True nếu máy có GPU
 
