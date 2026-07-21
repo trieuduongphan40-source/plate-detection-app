@@ -5,3 +5,8 @@ numpy
 ultralytics
 easyocr
 opencv-python-headless
+libgl1
+libglib2.0-0
+git add requirements.txt packages.txt
+git commit -m "Fix cv2 import error on Streamlit Cloud"
+git push
