@@ -21,6 +21,7 @@ Hệ thống tự động nhận diện:
 - 🚘 **Loại xe** (ô tô, xe máy, xe buýt, xe tải)
 - 🎨 **Màu xe**
 - 🔢 **Biển số xe**
+- 📏 **Khoảng cách ước tính**
 
 *Ứng dụng: Ghi nhận thông tin phương tiện khi xảy ra va chạm giao thông.*
 ''')
@@ -140,12 +141,31 @@ def read_plate_ocr(plate_crop):
 FOCAL_LENGTH_PX = 800  # cần hiệu chỉnh lại bằng ảnh mẫu khoảng cách đã biết
 
 def estimate_distance(plate_box):
+    """Ước tính khoảng cách dựa trên chiều rộng BIỂN SỐ — chính xác hơn, dùng khi thấy được biển."""
     x1, y1, x2, y2 = plate_box
     plate_width_px = x2 - x1
     if plate_width_px <= 0:
         return None
     real_width_mm = 440  # biển số ô tô VN chuẩn ~440mm
     distance_m = (real_width_mm * FOCAL_LENGTH_PX) / plate_width_px / 1000
+    return round(distance_m, 2)
+
+
+# Chiều rộng thực tế trung bình theo loại xe (mm) — dùng khi KHÔNG thấy biển số
+# (chỉ mang tính ước lượng thô, sai số lớn hơn cách tính theo biển số vì mỗi xe rộng khác nhau)
+REAL_VEHICLE_WIDTH_MM = {
+    'Car': 1800, 'Motorbike': 700, 'Bus': 2500, 'Truck': 2500,
+}
+
+def estimate_distance_vehicle(v_box, v_cls):
+    """Ước tính khoảng cách dựa trên chiều rộng cả XE — dùng dự phòng khi không detect được biển số
+    (ví dụ xe bị che biển, hoặc góc chụp không thấy biển)."""
+    x1, y1, x2, y2 = v_box
+    width_px = x2 - x1
+    if width_px <= 0:
+        return None
+    real_width_mm = REAL_VEHICLE_WIDTH_MM.get(v_cls, 1800)
+    distance_m = (real_width_mm * FOCAL_LENGTH_PX) / width_px / 1000
     return round(distance_m, 2)
 
 
@@ -162,9 +182,18 @@ def detect_vehicle_and_plate(frame, conf_threshold=0.25):
         cls_id = int(box.cls[0])
         if cls_id in VEHICLE_CLASSES:
             xyxy = box.xyxy[0].cpu().numpy()
-            vehicle_boxes.append((xyxy, VEHICLE_CLASSES[cls_id], float(box.conf[0])))
+            v_cls = VEHICLE_CLASSES[cls_id]
+            vehicle_boxes.append((xyxy, v_cls, float(box.conf[0])))
+
+            # Vẽ khung xe + GỌI TÊN loại xe ngay trên khung
             vx1, vy1, vx2, vy2 = map(int, xyxy)
             cv2.rectangle(result_img, (vx1, vy1), (vx2, vy2), (255, 200, 0), 2)
+            label = VEHICLE_VI.get(v_cls, v_cls)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(result_img, (vx1, max(0, vy1 - th - 10)),
+                          (vx1 + tw + 6, vy1), (255, 200, 0), -1)
+            cv2.putText(result_img, label, (vx1 + 3, max(15, vy1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
 
     plate_res = plate_model.predict(frame, conf=conf_threshold, verbose=False)[0]
     for box in plate_res.boxes:
@@ -177,7 +206,7 @@ def detect_vehicle_and_plate(frame, conf_threshold=0.25):
             continue
 
         plate_text, ocr_conf = read_plate_ocr(plate_crop)
-        distance = estimate_distance(plate_box)
+        distance = estimate_distance(plate_box)  # ưu tiên tính theo biển số (chính xác hơn)
 
         v_type, v_conf = match_plate_to_vehicle(plate_box, vehicle_boxes)
         v_color = 'N/A'
@@ -188,6 +217,10 @@ def detect_vehicle_and_plate(frame, conf_threshold=0.25):
                     v_crop = frame[vy1:vy2, vx1:vx2]
                     if v_crop.size > 0:
                         v_color = detect_vehicle_color(v_crop)
+                    # Nếu vì lý do nào đó không tính được khoảng cách theo biển số,
+                    # dùng khoảng cách theo chiều rộng xe làm dự phòng
+                    if distance is None:
+                        distance = estimate_distance_vehicle(v_box, v_cls)
                     break
 
         cv2.rectangle(result_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -207,6 +240,26 @@ def detect_vehicle_and_plate(frame, conf_threshold=0.25):
             'distance_m': distance,
         })
 
+    # Với những xe KHÔNG khớp được biển số nào (bị che biển / góc chụp không thấy biển),
+    # vẫn ghi nhận xe đó vào kết quả, dùng khoảng cách ước tính theo chiều rộng xe
+    matched_vehicle_types = {r['vehicle_type'] for r in results}
+    for v_box, v_cls, v_conf in vehicle_boxes:
+        if v_cls not in matched_vehicle_types:
+            vx1, vy1, vx2, vy2 = map(int, v_box)
+            v_crop = frame[vy1:vy2, vx1:vx2]
+            v_color = detect_vehicle_color(v_crop) if v_crop.size > 0 else 'N/A'
+            results.append({
+                'plate_box': None,
+                'plate_conf': 0.0,
+                'plate_text': '',
+                'ocr_conf': 0.0,
+                'plate_crop': None,
+                'vehicle_type': v_cls,
+                'vehicle_conf': v_conf,
+                'vehicle_color': v_color,
+                'distance_m': estimate_distance_vehicle(v_box, v_cls),
+            })
+
     return result_img, results, vehicle_boxes
 
 
@@ -221,6 +274,8 @@ st.sidebar.markdown('**Về hệ thống:**')
 st.sidebar.markdown('- Model: YOLOv8n')
 st.sidebar.markdown('- mAP50: **96.4%**')
 st.sidebar.markdown('- Dataset: 10,127 ảnh biển số VN')
+st.sidebar.markdown('- 📏 Khoảng cách: ưu tiên tính theo biển số, '
+                     'dự phòng theo chiều rộng xe nếu không thấy biển')
 
 tab1, tab2 = st.tabs(['📷 Ảnh', '🎬 Video'])
 
@@ -242,20 +297,23 @@ with tab1:
             st.warning('Không phát hiện phương tiện nào trong ảnh.')
         else:
             st.success(f'Phát hiện {len(vehicles)} phương tiện, '
-                       f'{len(detections)} biển số!')
+                       f'{sum(1 for d in detections if d["plate_text"])} biển số đọc được!')
 
             for i, d in enumerate(detections):
+                dist_str = f'{d["distance_m"]}m' if d['distance_m'] is not None else 'N/A'
                 with st.expander(
                     f'🚘 Phương tiện #{i+1} — '
                     f'{VEHICLE_VI[d["vehicle_type"]]} | '
                     f'{d["vehicle_color"]} | '
-                    f'Biển: {d["plate_text"] or "Không đọc được"}'
+                    f'Biển: {d["plate_text"] or "Không đọc được"} | '
+                    f'📏 {dist_str}'
                 ):
-                    col1, col2 = st.columns(2)
+                    col1, col2, col3 = st.columns(3)
                     col1.metric('Loại xe',    VEHICLE_VI[d['vehicle_type']])
                     col1.metric('Màu xe',     d['vehicle_color'])
                     col2.metric('Biển số',    d['plate_text'] or 'N/A')
                     col2.metric('Độ tin cậy detect', f"{d['plate_conf']:.1%}")
+                    col3.metric('Khoảng cách ước tính', dist_str)
 
                     if d['plate_crop'] is not None and d['plate_crop'].size > 0:
                         crop_rgb = cv2.cvtColor(
@@ -269,11 +327,13 @@ with tab1:
                 st.markdown('### 📋 Báo cáo nhanh')
                 for i, d in enumerate(detections):
                     plate_str = d['plate_text'] if d['plate_text'] else 'Không đọc được'
+                    dist_str = f'{d["distance_m"]}m' if d['distance_m'] is not None else 'N/A'
                     st.markdown(
                         f"**Xe #{i+1}:** "
                         f"{VEHICLE_VI[d['vehicle_type']]} | "
                         f"Màu {d['vehicle_color']} | "
-                        f"Biển số: `{plate_str}`"
+                        f"Biển số: `{plate_str}` | "
+                        f"Khoảng cách: {dist_str}"
                     )
 
 with tab2:
@@ -296,7 +356,7 @@ with tab2:
         frame_ph  = st.empty()
         progress  = st.progress(0)
         log_ph    = st.empty()
-        all_info  = {}  # plate_text -> {type, color, count}
+        all_info  = {}  # plate_text -> {type, color, count, distance_m}
 
         frame_idx = 0
         while True:
@@ -314,10 +374,12 @@ with tab2:
                     all_info[key] = {
                         'type':  VEHICLE_VI[d['vehicle_type']],
                         'color': d['vehicle_color'],
-                        'count': 1
+                        'count': 1,
+                        'distance_m': d['distance_m'],
                     }
                 else:
                     all_info[key]['count'] += 1
+                    all_info[key]['distance_m'] = d['distance_m']  # cập nhật khoảng cách mới nhất
 
             frame_ph.image(result_frame,
                            caption=f'Frame {frame_idx}/{total_fr}',
@@ -327,9 +389,11 @@ with tab2:
             if all_info:
                 log_text = '**Phương tiện đã ghi nhận:**\n'
                 for plate, info in all_info.items():
+                    dist_str = f'{info["distance_m"]}m' if info['distance_m'] is not None else 'N/A'
                     log_text += (f"- {info['type']} | "
                                  f"Màu {info['color']} | "
-                                 f"Biển: `{plate}` "
+                                 f"Biển: `{plate}` | "
+                                 f"📏 {dist_str} "
                                  f"({info['count']} lần)\n")
                 log_ph.markdown(log_text)
 
@@ -337,10 +401,12 @@ with tab2:
         st.success('Xử lý xong!')
         st.markdown('### 📋 Tổng kết')
         for plate, info in all_info.items():
+            dist_str = f'{info["distance_m"]}m' if info['distance_m'] is not None else 'N/A'
             st.markdown(
                 f"🚘 **{info['type']}** | "
                 f"Màu {info['color']} | "
-                f"Biển: `{plate}`"
+                f"Biển: `{plate}` | "
+                f"Khoảng cách: {dist_str}"
             )
 
 st.markdown('---')
