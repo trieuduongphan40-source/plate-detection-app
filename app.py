@@ -145,18 +145,21 @@ def estimate_distance(plate_box):
 # ============================================================
 # 6. HÀM CHÍNH — ghép toàn bộ pipeline
 # ============================================================
-def detect_vehicle_and_plate(frame):
+def detect_vehicle_and_plate(frame, conf_threshold=0.25):
     results = []
+    result_img = frame.copy()
 
-    vehicle_res = vehicle_model.predict(frame, verbose=False)[0]
+    vehicle_res = vehicle_model.predict(frame, conf=conf_threshold, verbose=False)[0]
     vehicle_boxes = []
     for box in vehicle_res.boxes:
         cls_id = int(box.cls[0])
         if cls_id in VEHICLE_CLASSES:
             xyxy = box.xyxy[0].cpu().numpy()
             vehicle_boxes.append((xyxy, VEHICLE_CLASSES[cls_id], float(box.conf[0])))
+            vx1, vy1, vx2, vy2 = map(int, xyxy)
+            cv2.rectangle(result_img, (vx1, vy1), (vx2, vy2), (255, 200, 0), 2)
 
-    plate_res = plate_model.predict(frame, verbose=False)[0]
+    plate_res = plate_model.predict(frame, conf=conf_threshold, verbose=False)[0]
     for box in plate_res.boxes:
         plate_box = box.xyxy[0].cpu().numpy()
         plate_conf = float(box.conf[0])
@@ -180,18 +183,24 @@ def detect_vehicle_and_plate(frame):
                         v_color = detect_vehicle_color(v_crop)
                     break
 
+        cv2.rectangle(result_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        if plate_text:
+            cv2.putText(result_img, plate_text, (x1, max(0, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         results.append({
             'plate_box': plate_box,
             'plate_conf': plate_conf,
             'plate_text': plate_text,
             'ocr_conf': ocr_conf,
+            'plate_crop': plate_crop,
             'vehicle_type': v_type or 'Không xác định',
             'vehicle_conf': v_conf or 0.0,
             'vehicle_color': v_color,
             'distance_m': distance,
         })
 
-    return results
+    return result_img, results, vehicle_boxes
 # ─── UI ───
 st.sidebar.header('⚙️ Cài đặt')
 conf_threshold = st.sidebar.slider(
