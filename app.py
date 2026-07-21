@@ -34,8 +34,7 @@ MODEL_PATH = 'best.pt'
 if not os.path.exists(MODEL_PATH):
     # Thay FILE_ID bằng ID thật của file best.pt trên Google Drive
     # (lấy từ link share: drive.google.com/file/d/FILE_ID/view)
-    gdown.download(id='https://drive.google.com/file/d/1QDoeKQBMa9O9riapJhxdmzxMozFfPIPL/view?usp=sharing', output=MODEL_PATH, quiet=False)
-
+   gdown.download(id='1QDoeKQBMa9O9riapJhxdmzxMozFfPIPL', output=MODEL_PATH, quiet=False)
 plate_model = YOLO(MODEL_PATH)
 vehicle_model = YOLO('yolov8n.pt')             # model COCO gốc, có sẵn, không cần train
 ocr_reader = easyocr.Reader(['en'], gpu=False) # đổi gpu=True nếu máy có GPU
