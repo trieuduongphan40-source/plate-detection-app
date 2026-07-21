@@ -302,7 +302,7 @@ with tab2:
             frame_idx += 1
             if frame_idx % 10 != 0: continue
 
-       result_frame, dets, _ = detect_vehicle_and_plate(frame, conf_threshold)
+        result_frame, dets, _ = detect_vehicle_and_plate(frame, conf_threshold)
             for d in dets:
                 key = d['plate_text'] or f'unknown_{frame_idx}'
                 if key not in all_info:
