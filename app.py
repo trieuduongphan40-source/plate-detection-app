@@ -2,6 +2,7 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
+import easyocr
 import gdown
 import os
 import re
@@ -24,182 +25,166 @@ Hệ thống tự động nhận diện:
 *Ứng dụng: Ghi nhận thông tin phương tiện khi xảy ra va chạm giao thông.*
 ''')
 
-# ─── Load model ───
-@st.cache_resource
-def load_models():
-    model_path = 'best.pt'
-    if not os.path.exists(model_path):
-        with st.spinner('Đang tải model lần đầu...'):
-            gdown.download(
-                'https://drive.google.com/uc?id=1cV3XdX9FP-hIqhmOBg6QIgnYp7FbZwzt',
-                model_path, quiet=False
-            )
-    plate_model   = YOLO(model_path)
-    vehicle_model = YOLO('yolov8n.pt')
-    return plate_model, vehicle_model
+# ============================================================
+# 1. LOAD MODEL (chạy 1 lần lúc khởi động app)
+# ============================================================
+plate_model = YOLO('weights/best.pt')          # model biển số bạn đã train
+vehicle_model = YOLO('yolov8n.pt')             # model COCO gốc, có sẵn, không cần train
+ocr_reader = easyocr.Reader(['en'], gpu=False) # đổi gpu=True nếu máy có GPU
 
-plate_model, vehicle_model = load_models()
-VEHICLE_CLASSES = {2:'car', 3:'motorcycle', 5:'bus', 7:'truck'}
-VEHICLE_VI = {
-    'car': 'Ô tô', 'motorcycle': 'Xe máy',
-    'bus': 'Xe buýt', 'truck': 'Xe tải', 'unknown': 'Không rõ'
-}
+# Các class xe trong COCO (chỉ giữ lại loại liên quan)
+VEHICLE_CLASSES = {2: 'Car', 3: 'Motorbike', 5: 'Bus', 7: 'Truck'}
 
-# ─── OCR ───
-@st.cache_resource
-def load_ocr():
-    import easyocr
-    return easyocr.Reader(['en'], verbose=False)
 
-ocr_reader = load_ocr()
+# ============================================================
+# 2. HÀM PHỤ TRỢ — khớp biển số với đúng xe chứa nó
+# ============================================================
+def bbox_center(box):
+    x1, y1, x2, y2 = box
+    return ((x1+x2)/2, (y1+y2)/2)
 
-def preprocess_plate(crop_bgr):
-    gray    = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    gray    = cv2.equalizeHist(gray)
-    resized = cv2.resize(gray, None, fx=2, fy=2,
-                         interpolation=cv2.INTER_CUBIC)
-    _, thresh = cv2.threshold(resized, 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+def point_in_box(point, box):
+    x, y = point
+    x1, y1, x2, y2 = box
+    return x1 <= x <= x2 and y1 <= y <= y2
 
-def fix_plate(text):
-    text = text.upper().strip()
-    text = re.sub(r'[^A-Z0-9\-]', '', text)
-    text = (text.replace('O','0').replace('Q','0')
-                .replace('I','1').replace('L','1')
-                .replace('S','5').replace('Z','2')
-                .replace('B','8').replace('G','6'))
-    text = re.sub(r'^(\d{2})([A-Z])', r'\1-\2', text)
+def match_plate_to_vehicle(plate_box, vehicle_boxes):
+    """Tìm xe nào chứa biển số này (biển số nằm trong bbox xe)"""
+    center = bbox_center(plate_box)
+    for v_box, v_cls, v_conf in vehicle_boxes:
+        if point_in_box(center, v_box):
+            return v_cls, v_conf
+    return None, None
+
+
+# ============================================================
+# 3. MÀU XE — HSV, không cần train
+# ============================================================
+def detect_vehicle_color(vehicle_crop):
+    """Xác định màu chủ đạo của xe bằng HSV"""
+    hsv = cv2.cvtColor(vehicle_crop, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    avg_h = np.median(h[s > 40])  if np.any(s > 40) else np.median(h)
+    avg_s = np.median(s)
+    avg_v = np.median(v)
+
+    if avg_v < 50:
+        return 'Đen'
+    if avg_s < 40 and avg_v > 180:
+        return 'Trắng'
+    if avg_s < 40:
+        return 'Xám/Bạc'
+
+    color_ranges = [
+        (0, 10, 'Đỏ'), (10, 25, 'Cam'), (25, 35, 'Vàng'),
+        (35, 85, 'Xanh lá'), (85, 130, 'Xanh dương'),
+        (130, 160, 'Tím'), (160, 180, 'Đỏ'),
+    ]
+    for lo, hi, name in color_ranges:
+        if lo <= avg_h < hi:
+            return name
+    return 'Không xác định'
+
+
+# ============================================================
+# 4. OCR — tiền xử lý + EasyOCR + hậu xử lý (đã tối ưu từ trước)
+# ============================================================
+def preprocess_plate(plate_img):
+    h, w = plate_img.shape[:2]
+    if h < 100:
+        scale = 100 / h
+        plate_img = cv2.resize(plate_img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.bilateralFilter(gray, 11, 17, 17)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    return clahe.apply(denoised)
+
+def clean_plate_text(raw_text):
+    text = re.sub(r'[^A-Z0-9]', '', raw_text.upper())
     return text
 
-def run_ocr(crop_bgr):
-    processed = preprocess_plate(crop_bgr)
-    result    = ocr_reader.readtext(processed, detail=1, paragraph=False)
-    if not result:
+def read_plate_ocr(plate_crop):
+    """Đọc ký tự biển số, trả về (text, confidence)"""
+    enhanced = preprocess_plate(plate_crop)
+    results = ocr_reader.readtext(
+        enhanced,
+        allowlist='0123456789ABCDEFGHKLMNPSTUVXYZ.-',
+        text_threshold=0.6, low_text=0.3, mag_ratio=2.0,
+    )
+    if not results:
         return '', 0.0
-    result = sorted(result, key=lambda r: (r[0][0][1], r[0][0][0]))
-    text   = ''.join([r[1] for r in result])
-    conf   = max([r[2] for r in result])
-    return fix_plate(text), round(conf, 4)
+    best = max(results, key=lambda r: r[2])
+    text = clean_plate_text(best[1])
+    conf = best[2]
+    return text, conf
 
-# ─── Nhận diện màu xe ───
-def detect_color(region_bgr):
-    if region_bgr is None or region_bgr.size == 0:
-        return 'Không rõ'
 
-    hsv = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2HSV)
-    h = hsv[:,:,0]
-    s = hsv[:,:,1]
-    v = hsv[:,:,2]
+# ============================================================
+# 5. KHOẢNG CÁCH — công thức pinhole camera, không cần train
+# ============================================================
+FOCAL_LENGTH_PX = 800  # cần hiệu chỉnh lại bằng ảnh mẫu khoảng cách đã biết
 
-    mean_v = float(v.mean())
-    mean_s = float(s.mean())
+def estimate_distance(plate_box):
+    x1, y1, x2, y2 = plate_box
+    plate_width_px = x2 - x1
+    if plate_width_px <= 0:
+        return None
+    real_width_mm = 440  # biển số ô tô VN chuẩn ~440mm
+    distance_m = (real_width_mm * FOCAL_LENGTH_PX) / plate_width_px / 1000
+    return round(distance_m, 2)
 
-    # Ưu tiên phát hiện trắng/đen/xám trước
-    # vì xe bãi giữ thường bị ánh đèn làm sai màu
-    if mean_s < 50:
-        if mean_v > 160: return 'Trắng/Bạc'
-        if mean_v < 70:  return 'Đen'
-        return 'Xám/Bạc'
 
-    # Chỉ xét màu thật khi saturation đủ cao
-    mask = (s > 60) & (v > 50) & (v < 230)
-    if mask.sum() < 200:
-        if mean_v > 160: return 'Trắng/Bạc'
-        if mean_v < 70:  return 'Đen'
-        return 'Xám/Bạc'
+# ============================================================
+# 6. HÀM CHÍNH — ghép toàn bộ pipeline
+# ============================================================
+def detect_vehicle_and_plate(frame):
+    results = []
 
-    h_vals  = h[mask]
-    mean_h  = float(np.median(h_vals))
+    vehicle_res = vehicle_model.predict(frame, verbose=False)[0]
+    vehicle_boxes = []
+    for box in vehicle_res.boxes:
+        cls_id = int(box.cls[0])
+        if cls_id in VEHICLE_CLASSES:
+            xyxy = box.xyxy[0].cpu().numpy()
+            vehicle_boxes.append((xyxy, VEHICLE_CLASSES[cls_id], float(box.conf[0])))
 
-    if mean_h < 10 or mean_h > 160: return 'Đỏ'
-    if 10  <= mean_h < 25:          return 'Cam'
-    if 25  <= mean_h < 35:          return 'Vàng'
-    if 35  <= mean_h < 85:          return 'Xanh lá'
-    if 85  <= mean_h < 130:         return 'Xanh dương'
-    if 130 <= mean_h < 160:         return 'Tím'
-    return 'Xám/Bạc'
+    plate_res = plate_model.predict(frame, verbose=False)[0]
+    for box in plate_res.boxes:
+        plate_box = box.xyxy[0].cpu().numpy()
+        plate_conf = float(box.conf[0])
 
-# ─── Helper ───
-def box_contains_center(outer, inner):
-    ox1,oy1,ox2,oy2 = outer
-    ix1,iy1,ix2,iy2 = inner
-    cx, cy = (ix1+ix2)/2, (iy1+iy2)/2
-    return ox1<=cx<=ox2 and oy1<=cy<=oy2
+        x1, y1, x2, y2 = map(int, plate_box)
+        plate_crop = frame[y1:y2, x1:x2]
+        if plate_crop.size == 0:
+            continue
 
-# ─── Hàm detect chính ───
-def detect(img_bgr, conf=0.25):
-    h_img, w_img = img_bgr.shape[:2]
+        plate_text, ocr_conf = read_plate_ocr(plate_crop)
+        distance = estimate_distance(plate_box)
 
-    # Detect xe
-    vehicles = []
-    for r in vehicle_model.predict(img_bgr, conf=conf, verbose=False):
-        if r.boxes is None: continue
-        for b in r.boxes:
-            cid = int(b.cls[0].item())
-            if cid in VEHICLE_CLASSES:
-                x1,y1,x2,y2 = map(int, b.xyxy[0].cpu().numpy())
-                # Crop vùng thân xe (bỏ 30% dưới để tránh lấy đường)
-                y_crop = y1 + int((y2-y1)*0.1)
-                y_crop_end = y1 + int((y2-y1)*0.7)
-                region = img_bgr[y_crop:y_crop_end, x1:x2]
-                color  = detect_color(region)
-                vehicles.append({
-                    'box':   (x1,y1,x2,y2),
-                    'type':  VEHICLE_CLASSES[cid],
-                    'color': color,
-                    'conf':  float(b.conf[0].item())
-                })
-
-    # Detect biển số
-    detections = []
-    for r in plate_model.predict(img_bgr, conf=conf, verbose=False):
-        if r.boxes is None: continue
-        for b in r.boxes:
-            px1,py1,px2,py2 = map(int, b.xyxy[0].cpu().numpy())
-            plate_conf = float(b.conf[0].item())
-
-            # Ghép với xe
-            matched = None
-            for v in vehicles:
-                if box_contains_center(v['box'],(px1,py1,px2,py2)):
-                    matched = v
+        v_type, v_conf = match_plate_to_vehicle(plate_box, vehicle_boxes)
+        v_color = 'N/A'
+        if v_type:
+            for v_box, v_cls, _ in vehicle_boxes:
+                if v_cls == v_type:
+                    vx1, vy1, vx2, vy2 = map(int, v_box)
+                    v_crop = frame[vy1:vy2, vx1:vx2]
+                    if v_crop.size > 0:
+                        v_color = detect_vehicle_color(v_crop)
                     break
 
-            # OCR
-            pad  = 4
-            crop = img_bgr[max(0,py1-pad):min(h_img,py2+pad),
-                           max(0,px1-pad):min(w_img,px2+pad)]
-            if crop.size == 0: continue
-            plate_text, ocr_conf = run_ocr(crop)
+        results.append({
+            'plate_box': plate_box,
+            'plate_conf': plate_conf,
+            'plate_text': plate_text,
+            'ocr_conf': ocr_conf,
+            'vehicle_type': v_type or 'Không xác định',
+            'vehicle_conf': v_conf or 0.0,
+            'vehicle_color': v_color,
+            'distance_m': distance,
+        })
 
-            detections.append({
-                'plate_box':    (px1,py1,px2,py2),
-                'plate_text':   plate_text,
-                'plate_conf':   plate_conf,
-                'ocr_conf':     ocr_conf,
-                'vehicle_type': matched['type']  if matched else 'unknown',
-                'vehicle_color':matched['color'] if matched else 'Không rõ',
-                'plate_crop':   crop,
-            })
-
-    # Vẽ kết quả
-    vis = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).copy()
-    for v in vehicles:
-        x1,y1,x2,y2 = v['box']
-        cv2.rectangle(vis,(x1,y1),(x2,y2),(0,200,0),2)
-        label = f"{VEHICLE_VI[v['type']]} | {v['color']}"
-        cv2.putText(vis, label, (x1, max(y1-10,0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,220,0), 2)
-    for d in detections:
-        x1,y1,x2,y2 = d['plate_box']
-        cv2.rectangle(vis,(x1,y1),(x2,y2),(255,50,50),2)
-        label = d['plate_text'] if d['plate_text'] else '?'
-        cv2.putText(vis, label, (x1, min(y2+22,vis.shape[0]-5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,50,50), 2)
-
-    return vis, detections, vehicles
-
+    return results
 # ─── UI ───
 st.sidebar.header('⚙️ Cài đặt')
 conf_threshold = st.sidebar.slider(
@@ -337,6 +322,5 @@ with tab2:
                 f"Màu {info['color']} | "
                 f"Biển: `{plate}`"
             )
-
 st.markdown('---')
 st.caption('Model: YOLOv8n | mAP50: 96.4% | Dataset: 10,127 ảnh biển số VN')
